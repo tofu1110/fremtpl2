@@ -1,0 +1,182 @@
+---
+title: "Data Checks and Cleaning Decisions (freMTPL2)"
+format: gfm
+execute:
+  warning: false
+  message: false
+---
+
+## Purpose
+
+Check the consistency and distribution of freMTPL2 and decide how each variable is cleaned. The cleaning follows Noll et al.(2018) unless stated otherwise.
+
+```{r}
+#| message: false
+library(here)
+library(data.table)
+library(ggplot2)
+
+freq <- as.data.table(readRDS(here("data", "raw", "freMTPL2freq.rds")))
+sev <- as.data.table(readRDS(here("data", "raw", "freMTPL2sev.rds")))
+
+freq[, IDpol := as.integer(as.character(IDpol))]
+sev[, IDpol := as.integer(as.character(IDpol))]
+
+str(freq)
+str(sev)
+```
+
+```{r}
+# Check that ClaimNb in freq matches the number of claims recorded in sev
+sev_count <- sev[, .(SevNb = .N), by = IDpol]
+
+check <- merge(
+  freq[, .(IDpol, ClaimNb)],
+  sev_count,
+  by = "IDpol",
+  all.x = TRUE
+)
+
+check[is.na(SevNb), SevNb := 0]    # policies not in sev have no recorded claims
+
+check[, consistent := ClaimNb == SevNb]
+
+table(check$consistent)
+
+# Claims in sev whose policy is missing from freq
+sev[!freq, on = "IDpol", .N]
+```
+
+## 1. Frequency data
+
+### 1.1 ClaimNb
+
+```{r}
+freq[, .N, by = ClaimNb][order(ClaimNb)]
+```
+
+
+```{r}
+freq[ClaimNb >= 4, .(ClaimNb, Exposure, annual_rate = ClaimNb / Exposure)][order(-ClaimNb)]
+```
+
+**Decision**: Following previous studies, we cap ClaimNb at 4 to limit the effect of extreme claim counts.
+
+### 1.2 Exposure
+
+```{r}
+freq[Exposure > 1, .N]
+```
+
+**Decision**: Following previous studies, we cap Exposure at 1.0. Values above 1 contradict to the definition.
+
+### 1.3 VehPower
+
+```{r}
+freq[, .N, by = VehPower][order(VehPower)]
+```
+
+**Decision**: VehPower has some sparse high-power groups and also shows an implausible upward turn at the maximum. Following previous studies, we deal with it as a categorical variable and group values of 9 and above into a single group.
+
+### 1.4 VehAge
+
+```{r}
+summary(freq$VehAge)
+
+hist(
+  freq$VehAge,
+  breaks = seq(0, 100, by = 5),
+  xlab = "VehAge",
+  ylab = "N"
+)
+```
+
+```{r}
+freq[VehAge >= 80, .N, by = VehAge][order(VehAge)]
+```
+
+**Decision**: VehAge is grouped into classes and treated as a categorical variable, following previous studies. The open-ended top class absorbs the sparse and erratic observations at the upper end.
+
+### 1.5 DrivAge
+
+```{r}
+summary(freq$DrivAge)
+
+hist(
+  freq$DrivAge,
+  breaks = seq(0, 100, by = 5),
+  xlab = "DrivAge",
+  ylab = "N"
+)
+```
+
+```{r}
+freq[DrivAge >= 91, .N, by = DrivAge][order(DrivAge)]
+```
+
+**Decision**: DrivAge is grouped into classes and treated as a categorical variable, following previous studies. The open-ended top class absorbs the sparse and erratic observations at 99.
+
+### 1.6 BonusMalus
+
+```{r}
+summary(freq$BonusMalus)
+
+hist(
+  freq$BonusMalus,
+  breaks = seq(50, 230, by = 10),
+  xlab = "BonusMalus",
+  ylab = "N"
+)
+```
+
+**Decision**: We cap it at 150 by following previous studies.
+
+### 1.7 Area vs Density
+
+```{r}
+summary(freq$Area)
+summary(freq$Density)
+cor(as.integer(freq$Area), log(freq$Density))
+```
+
+**Decision**: We use only log Density.
+
+## 2. Severity data
+
+```{r}
+# Share of the total claim amount from the largest 1, 5, 10 and 50 claims
+sev[order(-ClaimAmount),
+  .(top_k = c(1, 5, 10, 50),
+    share = cumsum(ClaimAmount)[c(1, 5, 10, 50)] / sum(ClaimAmount))]
+
+sev[order(-ClaimAmount)][1:10]
+```
+
+```{r}
+# For each candidate cap u:
+#   pct_excess: share of the total amount above u
+#   load_L    : flat load that restores the uncapped total
+thr <- c(1e4, 2e4, 5e4, 1e5, 2e5, 5e5)
+
+rbindlist(lapply(thr, function(u) sev[, .(
+  u          = u,
+  n_above    = sum(ClaimAmount > u),
+  pct_count  = mean(ClaimAmount > u),
+  pct_excess = sum(pmax(ClaimAmount - u, 0)) / sum(ClaimAmount),
+  load_L     = sum(ClaimAmount) / sum(pmin(ClaimAmount, u))
+)]))
+```
+
+**Decision**: Claim amounts are capped at 100k per claim. This affects only 41 claims (0.16%) and limits the influence of extreme losses on the Gamma GLM. The excess (17.7% of the amount) is added back through a flat load L ≈ 1.22 on the full data; the load used in the model is re-estimated on the training data.
+
+## References
+
+Noll, A., Salzmann, R. and Wüthrich, M. V. (2018).
+[Case Study: French Motor Third-Party Liability Claims](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3164764).
+SSRN.
+
+## Session Info
+
+```{r}
+sessionInfo()
+```

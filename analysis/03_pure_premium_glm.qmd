@@ -1,0 +1,280 @@
+---
+title: "Pure Premium Modelling with Frequency-Severity GLMs (freMTPL2)"
+format: gfm
+execute:
+  warning: false
+  message: false
+---
+
+## Summary
+ 
+- **Frequency:** A Poisson GLM beat the intercept-only baseline by 4.4% in
+  test deviance, mainly by capturing the high claim rates of young drivers.
+- **Severity:** Gamma GLMs overfit to a few large claims and did worse than
+  a constant mean on the test set, so the baseline is the better choice here.
+- **Pure premium:** Frequency GLM × constant severity ranked risks best on
+  the test set (Gini 0.31, top-to-bottom decile lift 7.3); adding a severity
+  GLM did not help.
+- **Calibration:** All models match the total claim level on the training
+  data (A/E ≈ 1); the test deviations of 2–4% are within sampling noise.
+  
+## Data
+ 
+We use the French motor third-party liability data freMTPL2 from
+CASdatasets. The cleaning decisions are documented in `02_data_check.qmd`.
+Policies are randomly split 80/20 into train and test sets, and all claims
+of a policy go to the same set.
+
+```{r}
+#| message: false
+library(here)
+library(data.table)
+library(ggplot2)
+
+source(here("R", "preprocess.R"))
+source(here("R", "split.R"))
+source(here("R", "metrics.R"))
+
+freq <- as.data.table(readRDS(here("data", "raw", "freMTPL2freq.rds")))
+sev <- as.data.table(readRDS(here("data", "raw", "freMTPL2sev.rds")))
+
+dat <- do.call(split_data, prepare_data(freq, sev))
+
+summary(dat$freq_train)
+summary(dat$sev_train)
+```
+
+## Frequency
+ 
+We fit a Poisson GLM with log exposure as an offset and compare it with an
+intercept-only model on the test set.
+
+```{r}
+freq_m0 <- glm(ClaimNb ~ 1 + offset(log(Exposure)),
+               family = poisson(), data = dat$freq_train)
+
+freq_m1 <- glm(
+  ClaimNb ~ VehPowerGrp + VehAgeGrp + DrivAgeGrp + BonusMalus +
+    VehBrand + VehGas + LogDensity + Region + offset(log(Exposure)),
+  family = poisson(),
+  data = dat$freq_train
+)
+
+freq_models <- list(null = freq_m0, glm = freq_m1)
+
+freq_result <- rbindlist(lapply(freq_models, function(m) {
+  mu <- predict(m, dat$freq_test, type = "response")
+  freq_metrics(dat$freq_test$ClaimNb, mu)
+}), idcol = "model")
+
+knitr::kable(freq_result, digits = 4)
+```
+
+The GLM reduces test deviance by about 4.4% relative to the intercept-only
+model.
+
+### Actual vs predicted by driver age
+ 
+Points show the observed and lines the predicted average frequency. Ages 85
+and above are pooled into 85.
+
+```{r}
+freq_by_age <- function(models, data) {
+  d <- data[, .(DrivAge = pmin(DrivAge, 85), Exposure, actual = ClaimNb)]
+  for (nm in names(models)) d[, (nm) := predict(models[[nm]], data, type = "response")]
+  d <- melt(d, id.vars = c("DrivAge", "Exposure"), variable.name = "series", value.name = "y")
+  d[, .(freq = sum(y) / sum(Exposure)), by = .(DrivAge, series)]
+}
+
+freq_plot <- rbindlist(list(
+  train = freq_by_age(freq_models, dat$freq_train),
+  test = freq_by_age(freq_models, dat$freq_test)
+), idcol = "data")
+freq_plot[, data := factor(data, c("train", "test"))]
+
+ggplot(mapping = aes(DrivAge, freq)) +
+  geom_point(data = freq_plot[series == "actual"], colour = "grey40") +
+  geom_line(data = freq_plot[series != "actual"], aes(colour = series)) +
+  facet_wrap(~ data) +
+  labs(x = "DrivAge", y = "average frequency", colour = "model")
+```
+
+The GLM captures the high claim frequency of young drivers.
+
+## Severity
+
+We fit Gamma GLMs with a log link on the capped claim amounts: a full model
+with the same variables as the frequency model, and a smaller model without
+VehBrand and Region.
+
+```{r}
+sev_m0 <- glm(ClaimAmountCap ~ 1, family = Gamma(link = "log"), data = dat$sev_train)
+
+sev_m1 <- glm(
+  ClaimAmountCap ~ VehPowerGrp + VehAgeGrp + DrivAgeGrp + BonusMalus +
+    VehBrand + VehGas + LogDensity + Region,
+  family = Gamma(link = "log"), data = dat$sev_train
+)
+
+sev_m2 <- glm(
+  ClaimAmountCap ~ VehPowerGrp + VehAgeGrp + DrivAgeGrp + BonusMalus +
+    VehGas + LogDensity,
+  family = Gamma(link = "log"), data = dat$sev_train
+)
+
+sev_models <- list(null = sev_m0, glm = sev_m1, glm_small = sev_m2)
+
+eval_sev <- function(models, data) {
+  rbindlist(lapply(models, function(m) {
+    mu <- predict(m, data, type = "response")
+    sev_metrics(data$ClaimAmountCap, mu)
+  }), idcol = "model")
+}
+
+sev_result <- rbindlist(list(
+  train = eval_sev(sev_models, dat$sev_train),
+  test = eval_sev(sev_models, dat$sev_test)
+), idcol = "data")
+
+knitr::kable(sev_result, digits = 4)
+```
+
+Both GLMs improve the training deviance but do worse than the
+intercept-only model on the test set, which indicates overfitting.
+
+All models have a test A/E below 1, because the mean severity in the test
+set is lower than in the training set. We compare this gap with the
+standard error of the mean test severity.
+ 
+```{r}
+x <- dat$sev_test$ClaimAmountCap
+se_rel <- sd(x) / mean(x) / sqrt(length(x))
+ae_test <- sev_result[data == "test" & model == "null", ae]
+ 
+c(se_rel = se_rel, n_se = (1 - ae_test) / se_rel)
+```
+
+The test A/E of the intercept-only model (`r round(ae_test, 3)`) differs
+from 1 by `r round((1 - ae_test) / se_rel, 1)` standard errors, which is
+consistent with sampling noise.
+
+### Actual vs predicted by driver age
+
+```{r}
+sev_by_age <- function(models, data) {
+  d <- data[, .(DrivAge = pmin(DrivAge, 85), actual = ClaimAmountCap)]
+  for (nm in names(models)) d[, (nm) := predict(models[[nm]], data, type = "response")]
+  d <- melt(d, id.vars = "DrivAge", variable.name = "series", value.name = "y")
+  d[, .(sev = mean(y)), by = .(DrivAge, series)]
+}
+
+sev_plot <- rbindlist(list(
+  train = sev_by_age(sev_models, dat$sev_train),
+  test = sev_by_age(sev_models, dat$sev_test)
+), idcol = "data")
+sev_plot[, data := factor(data, c("train", "test"))]
+
+ggplot(mapping = aes(DrivAge, sev)) +
+  geom_point(data = sev_plot[series == "actual"], colour = "grey40") +
+  geom_line(data = sev_plot[series != "actual"], aes(colour = series)) +
+  facet_wrap(~ data) +
+  labs(x = "DrivAge", y = "average severity", colour = "model")
+```
+
+The GLMs predict higher severity for drivers aged 18–20 and 71+, following
+a few large claims in the training data.
+
+## Pure premium
+ 
+The predicted loss of a policy is its predicted claim count times its
+predicted severity. We compare four combinations of frequency and severity
+models on the test set, with the capped claim amounts as actual loss.
+
+```{r}
+pp_test <- copy(dat$freq_test)
+
+loss_by_pol <- dat$sev_test[, .(loss = sum(ClaimAmountCap)), by = IDpol]
+pp_test[loss_by_pol, loss := i.loss, on = "IDpol"]
+pp_test[is.na(loss), loss := 0]
+```
+
+```{r}
+pp_test[, `:=`(
+  n_null = predict(freq_m0, pp_test, type = "response"),
+  n_glm = predict(freq_m1, pp_test, type = "response"),
+  s_null = predict(sev_m0, pp_test, type = "response"),
+  s_glm = predict(sev_m1, pp_test, type = "response"),
+  s_glm_small = predict(sev_m2, pp_test, type = "response")
+)]
+
+pp_preds <- list(
+  "null x null" = pp_test$n_null * pp_test$s_null,
+  "glm x null" = pp_test$n_glm * pp_test$s_null,
+  "glm x glm" = pp_test$n_glm * pp_test$s_glm,
+  "glm x glm_small" = pp_test$n_glm * pp_test$s_glm_small
+)
+```
+
+```{r}
+pp_result <- rbindlist(lapply(pp_preds, function(p) {
+  pp_metrics(pp_test$loss, p, pp_test$Exposure)
+}), idcol = "model")
+
+knitr::kable(pp_result, digits = 3)
+```
+
+Frequency GLM × constant severity gives the highest lift and Gini. Adding a
+severity GLM does not improve the risk ranking. The differences between the
+GLM combinations are small; Gini is the more stable measure, since lift
+depends only on the two extreme deciles.
+ 
+In the lift chart, policies are grouped into ten deciles of equal exposure
+by predicted pure premium. Points show the actual and lines the predicted
+pure premium.
+
+```{r}
+#| label: lift-chart
+
+lift_plot <- rbindlist(lapply(pp_preds[-1], function(p) {
+  lift_table(pp_test$loss, p, pp_test$Exposure)
+}), idcol = "model")
+
+ggplot(lift_plot, aes(bin, actual_pp)) +
+  geom_point(colour = "grey40") +
+  geom_line(aes(y = pred_pp), colour = "steelblue") +
+  facet_wrap(~ model) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(x = "risk decile (predicted pure premium)", y = "pure premium per exposure")
+```
+
+### Large-loss load
+
+```{r}
+sev_load <- dat$sev_train[, sum(ClaimAmount) / sum(ClaimAmountCap)]
+sev_load
+```
+
+Claims are capped at 100k for modelling. The final pure premium is the
+capped prediction multiplied by a flat large-loss load of 1.15, estimated
+on the training data only. Because the load is a constant multiplier, it
+does not change the lift or Gini results above.
+  
+## Pricing implications
+
+- **Differentiate on frequency.** The frequency GLM drives almost all of the
+  risk ranking, so rating factors should be chosen and validated on
+  claim frequency.
+- **Use a single average severity.** A constant severity plus a flat
+  large-loss load is sufficient. A severity GLM would add complexity and
+  charge some groups more on the basis of a few large claims, without
+  improving predictions.
+- **Driver age matters.** Drivers aged 18–20 claim about three times as
+  often as the portfolio average, which supports age-based premiums.
+
+## Session info
+
+```{r}
+sessionInfo()
+```
+  
+  
